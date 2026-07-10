@@ -516,6 +516,11 @@ impl RtcSctp {
     pub fn close_stream(&mut self, id: u16) {
         if let Some(entry) = self.entries.iter_mut().find(|v| v.id == id) {
             entry.do_close = true;
+
+            // Close esplicitally sctp stream to allow re-use of the same id.
+            if let Some(Ok(mut stream)) = self.assoc.as_mut().map(|assoc| assoc.stream(self.id)) {
+                let _ = stream.close();
+            }
         }
     }
 
@@ -761,6 +766,7 @@ impl RtcSctp {
                     Ok(mut s) => {
                         if !entry.configure_reliability(&mut s) {
                             entry.set_state(StreamEntryState::Closed);
+                            self.sctp_propagate_close(entry.id);
                             return Some(SctpEvent::Close { id: entry.id });
                         }
 
@@ -789,7 +795,9 @@ impl RtcSctp {
                                     );
                                     entry.do_close = true;
                                     entry.set_state(StreamEntryState::Closed);
-                                    return Some(SctpEvent::Close { id: entry.id });
+                                    let stream_id = entry.id;
+                                    self.sctp_propagate_close(stream_id);
+                                    return Some(SctpEvent::Close { id: stream_id });
                                 }
                             }
                         }
@@ -807,7 +815,9 @@ impl RtcSctp {
                             );
                             entry.do_close = true;
                             entry.set_state(StreamEntryState::Closed);
-                            return Some(SctpEvent::Close { id: entry.id });
+                            let stream_id = entry.id;
+                            self.sctp_propagate_close(stream_id);
+                            return Some(SctpEvent::Close { id: stream_id });
                         }
 
                         // Continuing means we are opening the stream out-of-band. The error can happen
@@ -817,7 +827,9 @@ impl RtcSctp {
                         warn!("Opening stream {} failed: {:?}", entry.id, e);
                         entry.do_close = true;
                         entry.set_state(StreamEntryState::Closed);
-                        return Some(SctpEvent::Close { id: entry.id });
+                        let stream_id = entry.id;
+                        self.sctp_propagate_close(stream_id);
+                        return Some(SctpEvent::Close { id: stream_id });
                     }
                 }
 
@@ -836,8 +848,11 @@ impl RtcSctp {
             }
 
             if entry.do_close && entry.state != StreamEntryState::Closed {
+                entry.set_close(&mut self);
                 entry.set_state(StreamEntryState::Closed);
-                return Some(SctpEvent::Close { id: entry.id });
+                let stream_id = entry.id;
+                self.sctp_propagate_close(stream_id);
+                return Some(SctpEvent::Close { id: stream_id });
             }
 
             let mut stream = match assoc.stream(entry.id) {
@@ -919,8 +934,13 @@ impl RtcSctp {
                                         entry.id, e
                                     );
                                     entry.do_close = true;
-                                    entry.set_state(StreamEntryState::Closed);
-                                    return Some(SctpEvent::Close { id: entry.id });
+
+                                    let stream_id = entry.id;
+                                    self.sctp_propagate_close(stream_id);
+                                    return Some(SctpEvent::Close { id: stream_id });
+
+                                    // entry.set_state(StreamEntryState::Closed);
+                                    // return Some(SctpEvent::Close { id: entry.id });
                                 }
                             }
                         }
@@ -986,6 +1006,13 @@ impl RtcSctp {
             .iter()
             .find(|s| s.id == sctp_stream_id)
             .and_then(|s| s.config.as_ref())
+    }
+
+    fn sctp_propagate_close(&mut self, stream_id: u16) {
+        // Close esplicitally sctp stream to allow re-use of the same id.
+        if let Some(Ok(mut stream)) = self.assoc.as_mut().map(|assoc| assoc.stream(stream_id)) {
+            let _ = stream.close();
+        }
     }
 
     #[cfg(test)]
@@ -1162,10 +1189,9 @@ mod tests {
         init_data.local_init_chunk().unwrap();
 
         let err = sctp.init(true, now, Some(init_data), None).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("SNAP requires both local and remote SCTP INIT chunks")
-        );
+        assert!(err
+            .to_string()
+            .contains("SNAP requires both local and remote SCTP INIT chunks"));
     }
 
     #[test]
