@@ -486,6 +486,50 @@ mod tests {
     }
 
     #[test]
+    fn negotiated_stream_id_cannot_overlap_held_generation() {
+        let now = Instant::now();
+        let mut handler = ChannelHandler::default();
+        let config = ChannelConfig {
+            negotiated: Some(4),
+            ..Default::default()
+        };
+
+        let old = handler.new_channel(&config);
+        handler.remove_channel(old, now);
+        handler.new_channel(&config);
+
+        let overlaps_held_generation = handler.allocations.iter().any(|allocation| {
+            handler
+                .closed_stream_ids
+                .iter()
+                .any(|closed| allocation.sctp_stream_id == Some(closed.stream_id))
+        });
+
+        assert!(
+            !overlaps_held_generation,
+            "a negotiated ID must remain unavailable until its old reset completes"
+        );
+    }
+
+    #[test]
+    fn stream_id_remains_held_without_reset_completion() {
+        let now = Instant::now();
+        let mut handler = ChannelHandler::default();
+
+        let id = handler.new_channel(&Default::default());
+        handler.allocations[0].sctp_stream_id = Some(0);
+        handler.remove_channel(id, now);
+
+        handler.expire_closed_stream_ids(now + STREAM_ID_MAX_HOLD);
+
+        assert_eq!(
+            handler.closed_stream_ids.len(),
+            1,
+            "elapsed time alone cannot make an SCTP stream ID safe to reuse"
+        );
+    }
+
+    #[test]
     fn stream_id_released_by_max_hold_fallback() {
         let now = Instant::now();
         let mut handler = ChannelHandler::default();

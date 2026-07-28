@@ -1,12 +1,33 @@
 use std::net::Ipv4Addr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use netem::NetemConfig;
 use str0m::channel::ChannelConfig;
-use str0m::{Event, RtcError};
+use str0m::{Event, Input, Output, RtcError};
 
 mod common;
-use common::{Peer, TestRtc, init_crypto_default, init_log, progress};
+use common::{Peer, TestRtc, connect_l_r, init_crypto_default, init_log, progress};
+
+/// Poll one peer while deliberately withholding all of its network output.
+///
+/// This models an application that keeps driving its local RTC while packets
+/// to the peer are delayed. Public events are returned to the test; transmits
+/// are dropped instead of being handed to the remote `TestRtc`.
+fn poll_without_delivering_network(
+    rtc: &mut TestRtc,
+    now: Instant,
+) -> Result<Vec<Event>, RtcError> {
+    rtc.rtc.handle_input(Input::Timeout(now))?;
+
+    let mut events = vec![];
+    loop {
+        match rtc.rtc.poll_output()? {
+            Output::Event(event) => events.push(event),
+            Output::Transmit(_) => {}
+            Output::Timeout(_) => return Ok(events),
+        }
+    }
+}
 
 #[test]
 pub fn data_channel() -> Result<(), RtcError> {
@@ -199,6 +220,130 @@ pub fn data_channel_close_reopen() -> Result<(), RtcError> {
             "data should flow on the reopened channel"
         );
     }
+
+    Ok(())
+}
+
+#[test]
+pub fn negotiated_reuse_waits_for_reset_before_channel_open() -> Result<(), RtcError> {
+    init_log();
+    init_crypto_default();
+
+    let (mut l, mut r) = connect_l_r();
+    let stream_id = 10;
+    let config = ChannelConfig {
+        label: "old-generation".into(),
+        negotiated: Some(stream_id),
+        ..Default::default()
+    };
+    let old_l = l.direct_api().create_data_channel(config.clone());
+    let _old_r = r.direct_api().create_data_channel(config);
+
+    loop {
+        progress(&mut l, &mut r)?;
+        let left_open = l
+            .events
+            .iter()
+            .any(|(_, event)| matches!(event, Event::ChannelOpen(id, _) if *id == old_l));
+        let right_open = r
+            .events
+            .iter()
+            .any(|(_, event)| matches!(event, Event::ChannelOpen(_, _)));
+        if left_open && right_open {
+            break;
+        }
+        assert!(
+            l.duration() < Duration::from_secs(10),
+            "negotiated channel should open on both peers"
+        );
+    }
+
+    l.events.clear();
+    l.direct_api().close_data_channel(old_l);
+
+    // Process the local close, but withhold its RE-CONFIG packets. The old
+    // SCTP stream therefore still exists and its reset cannot be complete.
+    let close_at = l.last;
+    let close_events = poll_without_delivering_network(&mut l, close_at)?;
+    assert!(
+        close_events
+            .iter()
+            .any(|event| matches!(event, Event::ChannelClose(id) if *id == old_l)),
+        "the old local channel should close"
+    );
+
+    let replacement = l.direct_api().create_data_channel(ChannelConfig {
+        label: "replacement".into(),
+        negotiated: Some(stream_id),
+        ..Default::default()
+    });
+    let replacement_events =
+        poll_without_delivering_network(&mut l, close_at + Duration::from_millis(1))?;
+
+    assert!(
+        !replacement_events
+            .iter()
+            .any(|event| matches!(event, Event::ChannelOpen(id, _) if *id == replacement)),
+        "a negotiated replacement must not open before the old reset completes"
+    );
+
+    Ok(())
+}
+
+#[test]
+pub fn max_hold_does_not_make_unconfirmed_stream_id_reusable() -> Result<(), RtcError> {
+    init_log();
+    init_crypto_default();
+
+    let (mut l, mut r) = connect_l_r();
+    let old = l.direct_api().create_data_channel(ChannelConfig::default());
+
+    loop {
+        progress(&mut l, &mut r)?;
+        if l.events
+            .iter()
+            .any(|(_, event)| matches!(event, Event::ChannelOpen(id, _) if *id == old))
+        {
+            break;
+        }
+        assert!(
+            l.duration() < Duration::from_secs(10),
+            "first channel should open"
+        );
+    }
+
+    let old_stream_id = l
+        .direct_api()
+        .sctp_stream_id_by_channel_id(old)
+        .expect("old channel should have a stream ID");
+    l.direct_api().close_data_channel(old);
+
+    // Drop all local reset traffic and advance beyond STREAM_ID_MAX_HOLD.
+    // No peer response has made the old ID safe during this interval.
+    let close_at = l.last;
+    let close_events = poll_without_delivering_network(&mut l, close_at)?;
+    assert!(
+        close_events
+            .iter()
+            .any(|event| matches!(event, Event::ChannelClose(id) if *id == old)),
+        "the old local channel should close"
+    );
+    poll_without_delivering_network(&mut l, close_at + Duration::from_secs(31))?;
+
+    let replacement = l.direct_api().create_data_channel(ChannelConfig::default());
+    poll_without_delivering_network(
+        &mut l,
+        close_at + Duration::from_secs(31) + Duration::from_millis(1),
+    )?;
+
+    let replacement_stream_id = l
+        .direct_api()
+        .sctp_stream_id_by_channel_id(replacement)
+        .expect("replacement should have a stream ID");
+    assert_ne!(
+        replacement_stream_id, old_stream_id,
+        "elapsed time cannot make an unconfirmed reset safe; another free ID should be used"
+    );
 
     Ok(())
 }

@@ -1425,6 +1425,97 @@ mod tests {
         assert_eq!(entry.state, StreamEntryState::Closed);
     }
 
+    #[test]
+    fn negotiated_reuse_does_not_report_open_for_old_closed_stream() {
+        let (mut client, _server) = connect_client_server();
+        let stream_id = 0;
+
+        let assoc = client.assoc.as_mut().unwrap();
+        let mut old = assoc
+            .open_stream(stream_id, PayloadProtocolIdentifier::Unknown)
+            .expect("old stream should open");
+        old.close().expect("old stream should start closing");
+
+        client.entries.push(StreamEntry {
+            config: Some(ChannelConfig {
+                label: "replacement".to_string(),
+                ordered: true,
+                reliability: Reliability::Reliable,
+                negotiated: Some(stream_id),
+                protocol: String::new(),
+            }),
+            state: StreamEntryState::AwaitOpen,
+            id: stream_id,
+            do_close: false,
+            open_deadline: None,
+            buffered_threshold: BufferedThresholdConfig::Unconfigured,
+        });
+
+        for _ in 0..10 {
+            match client.do_poll() {
+                Some(SctpEvent::Open { id, .. }) if id == stream_id => {
+                    panic!("replacement was reported open while the old stream still exists")
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+    }
+
+    #[test]
+    fn close_is_reported_before_reset_complete_when_events_are_batched() {
+        let now = Instant::now();
+        let (mut client, mut server) = connect_client_server();
+        let stream_id = 0;
+        let config = ChannelConfig {
+            label: "batched-close".to_string(),
+            negotiated: Some(stream_id),
+            ..Default::default()
+        };
+
+        client.open_stream(stream_id, config.clone());
+        server.open_stream(stream_id, config);
+        assert!(matches!(
+            client.do_poll(),
+            Some(SctpEvent::Open { id, .. }) if id == stream_id
+        ));
+        assert!(matches!(
+            server.do_poll(),
+            Some(SctpEvent::Open { id, .. }) if id == stream_id
+        ));
+
+        client.close_stream(stream_id);
+
+        // Move all reset packets in both directions without polling client
+        // application events. This batches Finished and ResetComplete in the
+        // association event queue, which is valid for a sans-I/O caller.
+        for _ in 0..4 {
+            while let Some(transmit) = client.poll_transmit() {
+                for packet in transmit_to_vec(transmit).unwrap() {
+                    server.handle_input(now, &packet);
+                }
+            }
+            while let Some(transmit) = server.poll_transmit() {
+                for packet in transmit_to_vec(transmit).unwrap() {
+                    client.handle_input(now, &packet);
+                }
+            }
+        }
+
+        for _ in 0..10 {
+            match client.do_poll() {
+                Some(SctpEvent::Close { id }) if id == stream_id => return,
+                Some(SctpEvent::StreamResetComplete { id }) if id == stream_id => {
+                    panic!("ResetComplete was reported before Close")
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+
+        panic!("stream close was not reported");
+    }
+
     /// Regression test: the DCEP-receiving side of an in-band channel must apply
     /// the DcepOpen reliability parameters (here: unordered) to its sctp-proto
     /// stream, instead of sending with stream defaults (ordered, fully reliable).
