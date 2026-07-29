@@ -1,6 +1,5 @@
 //! Data channel related types.
 
-use std::time::Duration;
 use std::{fmt, str, time::Instant};
 
 use crate::sctp::RtcSctp;
@@ -173,18 +172,9 @@ impl fmt::Debug for ChannelData {
 pub(crate) struct ChannelHandler {
     allocations: Vec<ChannelAllocation>,
     next_channel_id: usize,
-    /// Stream IDs of closed channels, excluded from allocation until the
-    /// reset handshake completes or the max-hold expires.
-    closed_stream_ids: Vec<ClosedStreamId>,
-}
-
-/// A stream ID held back from reallocation after its channel closed.
-#[derive(Debug)]
-struct ClosedStreamId {
-    stream_id: u16,
-    /// When the hold started. Only used for the max-hold fallback,
-    /// normal release is the reset-completion signal from SCTP.
-    held_since: Instant,
+    /// Stream IDs of closed channels whose reset handshake is still
+    /// outstanding, excluded from allocation until it completes.
+    closed_stream_ids: Vec<u16>,
 }
 
 #[derive(Debug)]
@@ -192,31 +182,31 @@ struct ChannelAllocation {
     id: ChannelId,
 
     /// Stream id, when it is known. This might be delayed awaiting sctp initialization to
-    /// know if we are client or server.
+    /// know if we are client or server, or awaiting the reset handshake of a previous
+    /// incarnation of a negotiated id.
     sctp_stream_id: Option<u16>,
+
+    /// The out-of-band negotiated stream id the user asked for. Promoted to
+    /// `sctp_stream_id` once reset which was holding it completes.
+    negotiated_stream_id: Option<u16>,
 
     /// Holds the config until it is used in handle_timeout.
     config: Option<ChannelConfig>,
 }
 
-/// Upper bound on how long a stream ID is held when the reset handshake never
-/// completes. Prevents leaking IDs forever.
-///
-/// The normal release path is the completion signal itself, the SCTP layer
-/// retries transient open errors.
-const STREAM_ID_MAX_HOLD: Duration = Duration::from_secs(30);
-
 impl ChannelHandler {
     pub fn new_channel(&mut self, config: &ChannelConfig) -> ChannelId {
         let id = self.next_channel_id();
 
-        // For out-of-band negotiated, the id is already set.
-        let sctp_stream_id = config.negotiated;
-        if let Some(sctp_stream_id) = sctp_stream_id {
-            let exists = self
-                .allocations
-                .iter()
-                .any(|a| a.sctp_stream_id == Some(sctp_stream_id));
+        // Out-of-band negotiated means the user names the stream id
+        // instead of us allocating one. We record it as a request in
+        // and leave `sctp_stream_id` unset.
+        let negotiated_stream_id = config.negotiated;
+        if let Some(sctp_stream_id) = negotiated_stream_id {
+            let exists = self.allocations.iter().any(|a| {
+                a.sctp_stream_id == Some(sctp_stream_id)
+                    || a.negotiated_stream_id == Some(sctp_stream_id)
+            });
             assert!(
                 !exists,
                 "sctp_stream_id ({}) exists already",
@@ -226,7 +216,8 @@ impl ChannelHandler {
 
         let alloc = ChannelAllocation {
             id,
-            sctp_stream_id,
+            sctp_stream_id: None,
+            negotiated_stream_id,
             // The config is none until we confirm we definitely want this channel.
             config: None,
         };
@@ -282,8 +273,17 @@ impl ChannelHandler {
         ChannelId(id)
     }
 
+    /// Whether a stream id is held back awaiting a reset completion.
+    fn is_held(&self, sctp_stream_id: u16) -> bool {
+        self.closed_stream_ids.contains(&sctp_stream_id)
+    }
+
     fn need_allocation(&self) -> bool {
-        self.allocations.iter().any(|a| a.sctp_stream_id.is_none())
+        self.allocations.iter().any(|a| {
+            a.sctp_stream_id.is_none()
+                // A negotiated id that is still held cannot be allocated yet.
+                && a.negotiated_stream_id.is_none_or(|want| !self.is_held(want))
+        })
     }
 
     fn need_open(&self) -> bool {
@@ -306,13 +306,28 @@ impl ChannelHandler {
             .allocations
             .iter()
             .filter_map(|a| a.sctp_stream_id)
-            .chain(self.closed_stream_ids.iter().map(|c| c.stream_id))
+            .chain(self.closed_stream_ids.iter().copied())
             .collect();
 
         for a in &mut self.allocations {
             if a.sctp_stream_id.is_some() {
                 continue;
             }
+
+            // Out-of-band negotiated. The user picked the id, all we do is wait until
+            // no closed generation of it is still awaiting its reset handshake.
+            if let Some(want) = a.negotiated_stream_id {
+                if taken.contains(&want) {
+                    debug!("Negotiated stream id {} still held, retry later", want);
+                    continue;
+                }
+
+                debug!("Associate negotiated stream id {:?} => {}", a.id, want);
+                a.sctp_stream_id = Some(want);
+                taken.push(want);
+                continue;
+            }
+
             // We need to allocate
             let mut proposed = base;
 
@@ -361,6 +376,7 @@ impl ChannelHandler {
             let alloc = ChannelAllocation {
                 id,
                 sctp_stream_id: Some(sctp_stream_id),
+                negotiated_stream_id: None,
                 config: None,
             };
             self.allocations.push(alloc);
@@ -379,32 +395,30 @@ impl ChannelHandler {
         }
     }
 
-    /// Release held stream IDs whose max-hold fallback expired.
-    /// The normal release path is `stream_reset_complete`,
-    /// this only reclaims IDs whose reset handshake never completes (broken/dead peer).
-    pub fn expire_closed_stream_ids(&mut self, now: Instant) {
-        self.closed_stream_ids
-            .retain(|c| now.duration_since(c.held_since) < STREAM_ID_MAX_HOLD);
-    }
-
     /// The reset handshake for a held stream ID completed, release it for
     /// reallocation immediately.
     pub fn stream_reset_complete(&mut self, stream_id: u16) {
-        self.closed_stream_ids.retain(|c| c.stream_id != stream_id);
+        self.closed_stream_ids.retain(|c| *c != stream_id);
     }
 
-    pub fn remove_channel(&mut self, id: ChannelId, now: Instant) {
-        if let Some(stream_id) = self
+    /// The association is gone, so no reset can ever complete on it.
+    /// The held IDs belong to an association nobody will send on again.
+    pub fn association_lost(&mut self) {
+        self.closed_stream_ids.clear();
+    }
+
+    /// Remove a closed channel.
+    pub fn remove_channel(&mut self, id: ChannelId, reset_pending: bool) {
+        let stream_id = self
             .allocations
             .iter()
             .find(|a| a.id == id)
-            .and_then(|a| a.sctp_stream_id)
-        {
-            self.closed_stream_ids.push(ClosedStreamId {
-                stream_id,
-                held_since: now,
-            });
+            .and_then(|a| a.sctp_stream_id);
+
+        if let (true, Some(stream_id)) = (reset_pending, stream_id) {
+            self.closed_stream_ids.push(stream_id);
         }
+
         self.allocations.retain(|a| a.id != id)
     }
 }
@@ -415,7 +429,6 @@ mod tests {
 
     #[test]
     fn channel_id_allocation() {
-        let now = Instant::now();
         let mut handler = ChannelHandler::default();
 
         // allocate first channel, get unique id
@@ -426,14 +439,13 @@ mod tests {
 
         // free channel 0, allocate two more channels and verify that the
         // new channels have unique IDs.
-        handler.remove_channel(ChannelId(0), now);
+        handler.remove_channel(ChannelId(0), true);
         assert_eq!(handler.new_channel(&Default::default()), ChannelId(2));
         assert_eq!(handler.new_channel(&Default::default()), ChannelId(3));
     }
 
     #[test]
     fn stream_id_held_until_reset_complete() {
-        let now = Instant::now();
         let mut handler = ChannelHandler::default();
 
         // Simulate two channels with known stream IDs (as if do_allocations ran
@@ -444,10 +456,9 @@ mod tests {
         handler.allocations[0].sctp_stream_id = Some(0);
         handler.allocations[1].sctp_stream_id = Some(2);
 
-        // Close channel 0 (stream ID 0). It should be held.
-        handler.remove_channel(id0, now);
-        assert_eq!(handler.closed_stream_ids.len(), 1);
-        assert_eq!(handler.closed_stream_ids[0].stream_id, 0);
+        // Close channel 0 (stream ID 0) with its reset outstanding. It should be held.
+        handler.remove_channel(id0, true);
+        assert_eq!(handler.closed_stream_ids, vec![0]);
 
         // Build the taken list as do_allocations does — stream 0 is held.
         let _id2 = handler.new_channel(&Default::default());
@@ -455,21 +466,12 @@ mod tests {
             .allocations
             .iter()
             .filter_map(|a| a.sctp_stream_id)
-            .chain(handler.closed_stream_ids.iter().map(|c| c.stream_id))
+            .chain(handler.closed_stream_ids.iter().copied())
             .collect();
         assert!(taken.contains(&0), "stream 0 should be held");
         assert!(taken.contains(&2), "stream 2 should be active");
 
-        // Elapsed time alone does not release the ID (short of max-hold):
-        // the release condition is the reset handshake completing.
-        handler.expire_closed_stream_ids(now + Duration::from_secs(10));
-        assert_eq!(
-            handler.closed_stream_ids.len(),
-            1,
-            "stream 0 should stay held until reset completes"
-        );
-
-        // The completion signal releases it immediately.
+        // The completion signal is the only thing that releases it.
         handler.stream_reset_complete(0);
         assert!(handler.closed_stream_ids.is_empty());
 
@@ -477,7 +479,7 @@ mod tests {
             .allocations
             .iter()
             .filter_map(|a| a.sctp_stream_id)
-            .chain(handler.closed_stream_ids.iter().map(|c| c.stream_id))
+            .chain(handler.closed_stream_ids.iter().copied())
             .collect();
         assert!(
             !taken_after.contains(&0),
@@ -487,22 +489,31 @@ mod tests {
 
     #[test]
     fn negotiated_stream_id_cannot_overlap_held_generation() {
-        let now = Instant::now();
+        let sctp = RtcSctp::new(1200);
         let mut handler = ChannelHandler::default();
         let config = ChannelConfig {
             negotiated: Some(4),
             ..Default::default()
         };
 
+        // The old generation was granted the id it asked for.
         let old = handler.new_channel(&config);
-        handler.remove_channel(old, now);
-        handler.new_channel(&config);
+        handler.do_allocations(&sctp);
+        assert_eq!(handler.stream_id_by_channel_id(old), Some(4));
+
+        handler.remove_channel(old, true);
+        assert_eq!(handler.closed_stream_ids, vec![4]);
+
+        // A replacement asking for the same id may be declared, but must stall
+        // without the id until the old reset completes.
+        let replacement = handler.new_channel(&config);
+        handler.do_allocations(&sctp);
 
         let overlaps_held_generation = handler.allocations.iter().any(|allocation| {
             handler
                 .closed_stream_ids
                 .iter()
-                .any(|closed| allocation.sctp_stream_id == Some(closed.stream_id))
+                .any(|closed| allocation.sctp_stream_id == Some(*closed))
         });
 
         assert!(
@@ -513,37 +524,49 @@ mod tests {
 
     #[test]
     fn stream_id_remains_held_without_reset_completion() {
-        let now = Instant::now();
+        let sctp = RtcSctp::new(1200);
         let mut handler = ChannelHandler::default();
 
         let id = handler.new_channel(&Default::default());
         handler.allocations[0].sctp_stream_id = Some(0);
-        handler.remove_channel(id, now);
+        handler.remove_channel(id, true);
 
-        handler.expire_closed_stream_ids(now + STREAM_ID_MAX_HOLD);
+        // There is no timer that can release the id.
+        for _ in 0..100 {
+            handler.do_allocations(&sctp);
+        }
 
         assert_eq!(
-            handler.closed_stream_ids.len(),
-            1,
+            handler.closed_stream_ids,
+            vec![0],
             "elapsed time alone cannot make an SCTP stream ID safe to reuse"
         );
     }
 
     #[test]
-    fn stream_id_released_by_max_hold_fallback() {
-        let now = Instant::now();
+    fn stream_id_not_held_when_no_reset_is_pending() {
         let mut handler = ChannelHandler::default();
 
         let id0 = handler.new_channel(&Default::default());
         handler.allocations[0].sctp_stream_id = Some(0);
-        handler.remove_channel(id0, now);
 
-        // Reset never completes. Just before max-hold: still held.
-        handler.expire_closed_stream_ids(now + STREAM_ID_MAX_HOLD - Duration::from_millis(1));
-        assert_eq!(handler.closed_stream_ids.len(), 1);
+        // The stream never made it into the association, so no reset was started and
+        // no completion will ever arrive. Holding the id would leak it forever.
+        handler.remove_channel(id0, false);
+        assert!(handler.closed_stream_ids.is_empty());
+    }
 
-        // At max-hold: released even without reset completion.
-        handler.expire_closed_stream_ids(now + STREAM_ID_MAX_HOLD);
+    #[test]
+    fn association_lost_releases_held_stream_ids() {
+        let mut handler = ChannelHandler::default();
+
+        let id0 = handler.new_channel(&Default::default());
+        handler.allocations[0].sctp_stream_id = Some(0);
+        handler.remove_channel(id0, true);
+        assert_eq!(handler.closed_stream_ids, vec![0]);
+
+        // No reset can complete on a dead association, nothing holds the id back.
+        handler.association_lost();
         assert!(handler.closed_stream_ids.is_empty());
     }
 }

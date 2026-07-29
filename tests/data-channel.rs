@@ -291,7 +291,7 @@ pub fn negotiated_reuse_waits_for_reset_before_channel_open() -> Result<(), RtcE
 }
 
 #[test]
-pub fn max_hold_does_not_make_unconfirmed_stream_id_reusable() -> Result<(), RtcError> {
+pub fn unconfirmed_reset_keeps_stream_id_reserved() -> Result<(), RtcError> {
     init_log();
     init_crypto_default();
 
@@ -318,8 +318,8 @@ pub fn max_hold_does_not_make_unconfirmed_stream_id_reusable() -> Result<(), Rtc
         .expect("old channel should have a stream ID");
     l.direct_api().close_data_channel(old);
 
-    // Drop all local reset traffic and advance beyond STREAM_ID_MAX_HOLD.
-    // No peer response has made the old ID safe during this interval.
+    // Drop all local reset traffic and advance well past the close. No peer response
+    // has made the old ID safe during this interval, so it stays reserved.
     let close_at = l.last;
     let close_events = poll_without_delivering_network(&mut l, close_at)?;
     assert!(

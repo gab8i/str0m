@@ -1731,14 +1731,17 @@ impl Rtc {
                     let id = self.chan.channel_id_by_stream_id(id).unwrap();
                     return Ok(Output::Event(Event::ChannelOpen(id, label)));
                 }
-                SctpEvent::Close { id: stream_id } => {
+                SctpEvent::Close {
+                    id: stream_id,
+                    reset_pending,
+                } => {
                     let Some(channel_id) = self.chan.channel_id_by_stream_id(stream_id) else {
                         warn!("Drop ChannelClose event for id: {:?}", stream_id);
                         continue;
                     };
-                    // remove_channel holds the stream id from reallocation until
-                    // the reset handshake completes.
-                    self.chan.remove_channel(channel_id, self.last_now);
+                    // When a reset is outstanding, remove_channel holds the stream id
+                    // back from reallocation until the handshake completes.
+                    self.chan.remove_channel(channel_id, reset_pending);
                     return Ok(Output::Event(Event::ChannelClose(channel_id)));
                 }
                 SctpEvent::StreamResetComplete { id } => {
@@ -1747,6 +1750,7 @@ impl Rtc {
                     continue;
                 }
                 SctpEvent::AssociationLost => {
+                    self.chan.association_lost();
                     self.start_close()?;
                     return Ok(Output::Event(Event::Closed));
                 }
@@ -2021,7 +2025,6 @@ impl Rtc {
         self.last_now = now;
         self.ice.handle_timeout(now);
         self.sctp.handle_timeout(now);
-        self.chan.expire_closed_stream_ids(now);
         self.chan.handle_timeout(now, &mut self.sctp);
         self.session.handle_timeout(now)?;
 
