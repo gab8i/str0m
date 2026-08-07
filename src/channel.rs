@@ -523,6 +523,62 @@ mod tests {
     }
 
     #[test]
+    fn negotiated_stream_keeps_config_while_waiting_for_reset() {
+        let mut sctp = RtcSctp::new(1200);
+        let mut handler = ChannelHandler::default();
+        let config = ChannelConfig {
+            label: "replacement".into(),
+            negotiated: Some(4),
+            ..Default::default()
+        };
+
+        handler.closed_stream_ids.push(4);
+        let replacement = handler.new_channel(&config);
+        handler.confirm(replacement, config);
+
+        handler.do_allocations(&sctp);
+        handler.open_channels(&mut sctp);
+
+        let allocation = handler
+            .allocations
+            .iter()
+            .find(|allocation| allocation.id == replacement)
+            .unwrap();
+        assert!(
+            allocation.config.is_some(),
+            "a negotiated channel must retain its config while its stream id is held"
+        );
+
+        handler.stream_reset_complete(4);
+        handler.do_allocations(&sctp);
+        handler.open_channels(&mut sctp);
+
+        assert_eq!(
+            sctp.config(4).map(|config| config.label.as_str()),
+            Some("replacement"),
+            "the negotiated channel must open once the old reset completes"
+        );
+    }
+
+    #[test]
+    fn one_reset_completion_releases_only_one_stream_generation() {
+        let mut handler = ChannelHandler::default();
+
+        // sctp-proto 0.10.3 reports reset completion per stream generation.
+        // Two outstanding generations of the same stream id therefore need two
+        // completion events before the id is reusable.
+        handler.closed_stream_ids.extend([4, 4]);
+
+        handler.stream_reset_complete(4);
+
+        assert_eq!(
+            handler.closed_stream_ids,
+            vec![4],
+            "the first completion must not release a newer pending generation"
+        );
+    }
+
+    #[test]
     fn stream_id_remains_held_without_reset_completion() {
         let sctp = RtcSctp::new(1200);
         let mut handler = ChannelHandler::default();
