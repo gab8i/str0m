@@ -345,10 +345,14 @@ impl ChannelHandler {
     // Actually open channels.
     fn open_channels(&mut self, sctp: &mut RtcSctp) {
         for a in &mut self.allocations {
-            let Some(config) = a.config.take() else {
+            // The stream id must be known before the config is taken. A negotiated
+            // channel waiting out a previous incarnation's reset has no id yet, and
+            // consuming its config here would leave nothing to open it with once the
+            // id is released.
+            let Some(sctp_stream_id) = a.sctp_stream_id else {
                 continue;
             };
-            let Some(sctp_stream_id) = a.sctp_stream_id else {
+            let Some(config) = a.config.take() else {
                 continue;
             };
 
@@ -397,8 +401,14 @@ impl ChannelHandler {
 
     /// The reset handshake for a held stream ID completed, release it for
     /// reallocation immediately.
+    ///
+    /// Completions are reported per stream generation, so the same id can be held
+    /// more than once when resets overlap. Release a single generation, the id only
+    /// becomes reusable once every one of them has completed.
     pub fn stream_reset_complete(&mut self, stream_id: u16) {
-        self.closed_stream_ids.retain(|c| *c != stream_id);
+        if let Some(pos) = self.closed_stream_ids.iter().position(|c| *c == stream_id) {
+            self.closed_stream_ids.remove(pos);
+        }
     }
 
     /// The association is gone, so no reset can ever complete on it.
